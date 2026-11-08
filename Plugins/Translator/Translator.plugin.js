@@ -383,6 +383,10 @@ module.exports = (_ => {
 		var channelLanguages = {}, guildLanguages = {};
 		var translationEnabledStates = [], isTranslating;
 		var translatedMessages = {}, oldMessages = {};
+		var autoCache = null, autoCacheDirty = false, autoCacheSaveTimeout;
+		const AUTO_CACHE_MAX = 30000;
+		var autoPending = {}, autoSeen = {}, autoRerenderTimeout, autoFlushTimeout, autoLastFlush = 0, autoFlushing = false, autoTargets = [];
+		const AUTO_MAX_CHARS = 4000, AUTO_MAX_ITEMS = 80;
 		
 		const defaultLanguages = {
 			INPUT: "auto",
@@ -406,9 +410,13 @@ module.exports = (_ => {
 						addTranslateButton:		{value: true, 	popout: false},
 						addQuickTranslateButton:	{value: true, 	popout: false},
 						usePerChatTranslation:		{value: true, 	popout: false},
+						autoTranslateReceived:		{value: true, 	popout: false,	description: "Auto-translate received Messages in enabled chats (right-click a DM, channel or server ➝ Auto-translate)"},
 						sendOriginalMessage:		{value: false, 	popout: true},
 						showOriginalMessage:		{value: false, 	popout: true},
 						useSpoilerInOriginal:		{value: false, 	popout: false,	description: "Use Spoilers instead of Quotes for the original Message Text"}
+					},
+					amounts: {
+						autoTranslateInterval:		{value: 30, 	min: 1,	max: 3600,	description: "Auto-translate batch interval in seconds (new messages are collected and sent to the translator together at most once per interval)"}
 					},
 					choices: {},
 					exceptions: {
@@ -486,6 +494,13 @@ module.exports = (_ => {
 			}
 			
 			onStop () {
+				this.saveAutoCache(true);
+				if (this._autoScrollHook) {
+					document.removeEventListener("scroll", this._autoScrollHook, true);
+					document.removeEventListener("wheel", this._autoWheelHook, {capture: true});
+					document.removeEventListener("keydown", this._autoWheelHook, true);
+					this._autoScrollHook = this._autoWheelHook = null;
+				}
 				this.forceUpdateAll();
 			}
 
@@ -502,6 +517,47 @@ module.exports = (_ => {
 							keys: ["general", key],
 							label: this.labels[`general_${key}`] || this.defaults.general[key].description,
 							value: this.settings.general[key]
+						}));
+
+						settingsItems.push(BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsSaveItem, {
+							type: "TextInput",
+							childProps: {type: "number"},
+							plugin: this,
+							keys: ["amounts", "autoTranslateInterval"],
+							label: this.defaults.amounts.autoTranslateInterval.description,
+							basis: "20%",
+							min: 1,
+							max: 3600,
+							value: this.settings.amounts.autoTranslateInterval
+						}));
+
+						settingsItems.push(BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsPanelList, {
+							title: "Auto-translate enabled in:",
+							children: autoTargets.length ? autoTargets.map(target => BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
+								type: "Switch",
+								label: this.getAutoTargetName(target),
+								tag: BDFDB.LibraryComponents.FormTitle.Tags.H5,
+								value: true,
+								onChange: value => {
+									if (value != this.isAutoTarget(target)) this.toggleAutoTarget(target);
+								}
+							})) : BDFDB.ReactUtils.createElement("div", {
+								className: BDFDB.disCN.marginbottom8,
+								style: {color: "var(--text-muted)"},
+								children: "No chats yet. Right-click a DM, channel, thread or server and tick \"Auto-translate\"."
+							})
+						}));
+
+						settingsItems.push(BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
+							type: "Button",
+							label: `Saved auto-translations: ${Object.keys(this.getAutoCache()).length} messages (kept across restarts, newest ${AUTO_CACHE_MAX} kept)`,
+							tag: BDFDB.LibraryComponents.FormTitle.Tags.H5,
+							color: BDFDB.LibraryComponents.Button.Colors.RED,
+							children: "Clear",
+							onClick: _ => {
+								this.clearAutoCache();
+								BDFDB.NotificationUtils.toast("Translation cache cleared", {type: "success"});
+							}
 						}));
 						
 						settingsItems.push(BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.FormDivider, {
@@ -801,6 +857,9 @@ module.exports = (_ => {
 				
 				translationEnabledStates = BDFDB.DataUtils.load(this, "translationEnabledStates");
 				translationEnabledStates = BDFDB.ArrayUtils.is(translationEnabledStates) ? translationEnabledStates : [];
+
+				autoTargets = BDFDB.DataUtils.load(this, "autoTranslateTargets");
+				autoTargets = BDFDB.ArrayUtils.is(autoTargets) ? autoTargets : [];
 				
 				this.setLanguages();
 				BDFDB.PatchUtils.forceAllUpdates(this);
@@ -1019,6 +1078,7 @@ module.exports = (_ => {
 			}
 			
 			checkMessage (stream, message) {
+				this.queueAutoTranslate(message);
 				let translation = translatedMessages[message.id];
 				if (translation) stream.content.content = translation.content;
 				else if (oldMessages[message.id] && Object.keys(message).some(key => !BDFDB.equals(oldMessages[message.id][key], message[key]))) {
@@ -1188,7 +1248,401 @@ module.exports = (_ => {
 				}
 			}
 
-			translateMessage (message, channel) {
+			getAutoTargetsForChannel (channelId) {
+				let channel = channelId && BDFDB.LibraryStores.ChannelStore.getChannel(channelId);
+				if (!channel) return [];
+				let targets = [`c:${channel.id}`];
+				if (channel.parent_id) targets.push(`c:${channel.parent_id}`);
+				if (channel.guild_id) targets.push(`g:${channel.guild_id}`);
+				else targets.push("dms");
+				return targets;
+			}
+
+			isAutoEnabledForChannel (channelId) {
+				return this.getAutoTargetsForChannel(channelId).some(t => autoTargets.includes(t));
+			}
+
+			isAutoTarget (target) {
+				return autoTargets.includes(target);
+			}
+
+			toggleAutoTarget (target) {
+				if (autoTargets.includes(target)) BDFDB.ArrayUtils.remove(autoTargets, target, true);
+				else autoTargets.push(target);
+				BDFDB.DataUtils.save(autoTargets, this, "autoTranslateTargets");
+				autoSeen = {};
+				for (let id in autoPending) if (!this.isAutoEnabledForChannel(autoPending[id].channel_id)) delete autoPending[id];
+				BDFDB.MessageUtils.rerenderAll(true);
+			}
+
+			getAutoTargetName (target) {
+				if (target == "dms") return "All Direct Messages";
+				let id = target.slice(2);
+				if (target.indexOf("g:") == 0) {
+					let guild = BDFDB.LibraryStores.GuildStore.getGuild(id);
+					return `Server: ${guild ? guild.name : id}`;
+				}
+				let channel = BDFDB.LibraryStores.ChannelStore.getChannel(id);
+				if (!channel) return `Channel: ${id}`;
+				if (channel.guild_id) {
+					let guild = BDFDB.LibraryStores.GuildStore.getGuild(channel.guild_id);
+					return `#${channel.name}${guild ? ` (${guild.name})` : ""}`;
+				}
+				if (channel.name) return `Group DM: ${channel.name}`;
+				let user = channel.recipients && channel.recipients[0] && BDFDB.LibraryStores.UserStore.getUser(channel.recipients[0]);
+				return `DM: ${user ? (user.globalName || user.username) : id}`;
+			}
+
+			createAutoMenuItem (target, label) {
+				return BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuCheckboxItem, {
+					label: label,
+					id: BDFDB.ContextMenuUtils.createItemId(this.name, "auto-translate", target),
+					checked: this.isAutoTarget(target),
+					action: _ => this.toggleAutoTarget(target)
+				});
+			}
+
+			insertAutoMenuItems (returnvalue, items) {
+				if (!this.settings.general.autoTranslateReceived) return;
+				items = items.filter(n => n);
+				if (!items.length) return;
+				let group = BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuGroup, {children: items});
+				let [children, index] = BDFDB.ContextMenuUtils.findItem(returnvalue, {id: ["devmode-copy-id", "copy-channel-id", "copy-guild-id", "copy-user-id"], group: true});
+				if (children && index > -1) return children.splice(index, 0, group);
+				let menu = BDFDB.ArrayUtils.is(returnvalue) ? {props: {children: returnvalue}} : BDFDB.ReactUtils.findChild(returnvalue, {props: "navId"});
+				if (menu && BDFDB.ArrayUtils.is(menu.props.children)) menu.props.children.push(group);
+				else if (menu) menu.props.children = [menu.props.children, group];
+			}
+
+			onChannelContextMenu (e) {
+				let channel = e.instance.props.channel;
+				if (!channel) return;
+				this.insertAutoMenuItems(e.returnvalue, [
+					this.createAutoMenuItem(`c:${channel.id}`, channel.guild_id ? "Auto-translate this channel" : "Auto-translate this DM"),
+					!channel.guild_id && this.createAutoMenuItem("dms", "Auto-translate all DMs")
+				]);
+			}
+
+			onThreadContextMenu (e) {
+				let channel = e.instance.props.channel;
+				if (!channel) return;
+				this.insertAutoMenuItems(e.returnvalue, [this.createAutoMenuItem(`c:${channel.id}`, "Auto-translate this thread")]);
+			}
+
+			onGroupDMContextMenu (e) {
+				let channel = e.instance.props.channel;
+				if (!channel) return;
+				this.insertAutoMenuItems(e.returnvalue, [
+					this.createAutoMenuItem(`c:${channel.id}`, "Auto-translate this group DM"),
+					this.createAutoMenuItem("dms", "Auto-translate all DMs")
+				]);
+			}
+
+			onGuildContextMenu (e) {
+				let guild = e.instance.props.guild;
+				if (!guild) return;
+				this.insertAutoMenuItems(e.returnvalue, [this.createAutoMenuItem(`g:${guild.id}`, "Auto-translate this server")]);
+			}
+
+			onUserContextMenu (e) {
+				let user = e.instance.props.user;
+				let channel = e.instance.props.channel;
+				if (!channel || channel.guild_id || channel.type != 1) {
+					let dmId = user && BDFDB.LibraryStores.ChannelStore.getDMFromUserId && BDFDB.LibraryStores.ChannelStore.getDMFromUserId(user.id);
+					channel = dmId && BDFDB.LibraryStores.ChannelStore.getChannel(dmId);
+				}
+				let me = BDFDB.UserUtils.me;
+				if (!channel || user && me && user.id == me.id) return;
+				this.insertAutoMenuItems(e.returnvalue, [
+					this.createAutoMenuItem(`c:${channel.id}`, "Auto-translate DM with this user"),
+					this.createAutoMenuItem("dms", "Auto-translate all DMs")
+				]);
+			}
+
+			queueAutoTranslate (message) {
+				if (!this.settings.general.autoTranslateReceived || !message || !message.id || autoSeen[message.id] || translatedMessages[message.id]) return;
+				if (!autoTargets.length || !this.isAutoEnabledForChannel(message.channel_id)) return;
+				autoSeen[message.id] = true;
+				let me = BDFDB.UserUtils.me;
+				if (me && message.author && message.author.id == me.id) return;
+				let text = (message.content || "").trim();
+				let hasEmbeds = !text && message.embeds && message.embeds.some(embed => embed.rawTitle || embed.rawDescription || (embed.fields && embed.fields.length));
+				if (!text && !hasEmbeds) return;
+				if (text && !/\p{L}{2,}|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]/u.test(text.replace(/<a?:\w+:\d+>|<[@#][!&]?\d+>|https?:\/\/\S+/g, ""))) return;
+				let cached = this.getAutoCache()[message.id];
+				if (cached && cached.o === this.getAutoOrigKey(message) && cached.x === this.getLanguageChoice(languageTypes.OUTPUT, messageTypes.RECEIVED, message.channel_id)) {
+					if (!cached.s) {
+						this.applyAutoTranslation(message, cached.c, cached.e || {}, cached.i, cached.x);
+					}
+					return;
+				}
+				autoPending[message.id] = message;
+				this.scheduleAutoFlush();
+			}
+
+			scheduleAutoFlush () {
+				if (autoFlushTimeout || autoFlushing || !Object.keys(autoPending).length) return;
+				let interval = Math.min(3600, Math.max(1, parseFloat(this.settings.amounts && this.settings.amounts.autoTranslateInterval) || 30)) * 1000;
+				let delay = Math.max(1000, autoLastFlush + interval - Date.now());
+				autoFlushTimeout = BDFDB.TimeUtils.timeout(_ => {
+					autoFlushTimeout = null;
+					this.flushAutoTranslate();
+				}, delay);
+			}
+
+			flushAutoTranslate () {
+				let messages = Object.values(autoPending).filter(m => !translatedMessages[m.id] && this.isAutoEnabledForChannel(m.channel_id));
+				autoPending = {};
+				if (!messages.length) return;
+				autoFlushing = true;
+				autoLastFlush = Date.now();
+				let groups = {};
+				for (let message of messages) {
+					let input = this.getLanguageChoice(languageTypes.INPUT, messageTypes.RECEIVED, message.channel_id);
+					let output = this.getLanguageChoice(languageTypes.OUTPUT, messageTypes.RECEIVED, message.channel_id);
+					if (input == output || languages[input] && languages[input].special || languages[output] && languages[output].special) continue;
+					let key = input + "|" + output;
+					if (!groups[key]) groups[key] = {input, output, items: []};
+					let content = (message.content || "").trim();
+					let parts = [];
+					if (content) {
+						let [newText, excepts, translate] = this.removeExceptions(content, messageTypes.RECEIVED);
+						if (translate) parts.push({kind: "content", text: newText, excepts, original: content});
+					}
+					else (message.embeds || []).forEach(embed => {
+						let pushPart = (field, text, extra) => {
+							text = (text || "").trim();
+							if (text) parts.push(Object.assign({kind: "embed", embedId: embed.id, field, text, excepts: {}, original: text}, extra));
+						};
+						pushPart("title", embed.rawTitle);
+						pushPart("description", embed.rawDescription);
+						pushPart("footerText", embed.footer && embed.footer.text);
+						(embed.fields || []).forEach((f, i) => {
+							pushPart("fieldName", f.rawName, {index: i});
+							pushPart("fieldValue", f.rawValue, {index: i});
+						});
+					});
+					if (parts.length) groups[key].items.push({message, parts});
+				}
+				let chunks = [];
+				for (let key in groups) {
+					let chunk = null;
+					for (let item of groups[key].items) {
+						let size = item.parts.reduce((n, part) => n + encodeURIComponent(part.text).length, 0);
+						if (!chunk || chunk.parts + item.parts.length > AUTO_MAX_ITEMS || chunk.size + size > AUTO_MAX_CHARS * 3) chunks.push(chunk = {input: groups[key].input, output: groups[key].output, items: [], parts: 0, size: 0});
+						chunk.items.push(item);
+						chunk.parts += item.parts.length;
+						chunk.size += size;
+					}
+				}
+				let next = _ => {
+					if (!chunks.length) {
+						autoFlushing = false;
+						return this.scheduleAutoFlush();
+					}
+					this.translateAutoChunk(chunks.shift(), _ => BDFDB.TimeUtils.timeout(next, 500));
+				};
+				next();
+			}
+
+			translateAutoChunk (chunk, callback) {
+				let allParts = chunk.items.map(item => item.parts).flat();
+				let body = allParts.map(part => "q=" + encodeURIComponent(part.text)).join("&");
+				let done = false, finish = _ => {
+					if (done) return;
+					done = true;
+					callback();
+				};
+				BDFDB.LibraryRequires.request(`https://translate.googleapis.com/translate_a/t?client=gtx&sl=${encodeURIComponent(chunk.input)}&tl=${encodeURIComponent(chunk.output)}`, {
+					method: "post",
+					timeout: 30000,
+					headers: {"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+					body: body
+				}, (error, response, result) => {
+					if (error || !result || !response || response.statusCode != 200) {
+						if (response && response.statusCode == 429) {
+							autoLastFlush = Date.now() + 5 * 60 * 1000;
+							BDFDB.LogUtils.warn("Google rate limit (429) - pausing auto-translate for ~5 min", this);
+						}
+						for (let item of chunk.items) delete autoSeen[item.message.id];
+						return finish();
+					}
+					try {
+						result = JSON.parse(result);
+						if (!BDFDB.ArrayUtils.is(result)) result = [result];
+						allParts.forEach((part, i) => {
+							let entry = result[i];
+							part.translation = BDFDB.ArrayUtils.is(entry) ? entry[0] : entry;
+							part.src = BDFDB.ArrayUtils.is(entry) ? entry[1] : chunk.input;
+						});
+					}
+					catch (err) {
+						BDFDB.LogUtils.error(["Auto-translate batch parse failed", err], this);
+						return finish();
+					}
+					let changed = false;
+					for (let item of chunk.items) {
+						let message = item.message;
+						if (translatedMessages[message.id]) continue;
+						let src = (item.parts.find(part => part.src && part.src != "auto") || {}).src || chunk.input;
+						if (src == chunk.output) {
+							this.putAutoCache(message, {s: 1, x: chunk.output});
+							continue;
+						}
+						let anyDiff = false;
+						item.parts.forEach(part => {
+							part.result = typeof part.translation == "string" ? this.addExceptions(part.translation, part.excepts) : part.original;
+							if (part.result.trim().toLowerCase() != part.original.trim().toLowerCase()) anyDiff = true;
+						});
+						if (!anyDiff) {
+							this.putAutoCache(message, {s: 1, x: chunk.output});
+							continue;
+						}
+						let contentPart = item.parts.find(part => part.kind == "content");
+						let embeds = {};
+						(contentPart ? [] : message.embeds || []).forEach(embed => {
+							let get = (field, index) => {
+								let part = item.parts.find(p => p.kind == "embed" && p.embedId == embed.id && p.field == field && (index === undefined || p.index == index));
+								return part ? part.result : "";
+							};
+							embeds[embed.id] = {
+								title: get("title") || embed.rawTitle || "",
+								description: get("description") || embed.rawDescription || "",
+								footerText: get("footerText") || (embed.footer && embed.footer.text) || "",
+								fields: (embed.fields || []).map((f, i) => ({name: get("fieldName", i) || f.rawName, value: get("fieldValue", i) || f.rawValue}))
+							};
+						});
+						let raw = contentPart ? contentPart.result.trim() : null;
+						this.applyAutoTranslation(message, raw, embeds, src, chunk.output);
+						this.putAutoCache(message, {c: raw, e: Object.keys(embeds).length ? embeds : undefined, i: src, x: chunk.output});
+						changed = true;
+					}
+					if (changed) this.scheduleAutoRerender();
+					finish();
+				});
+			}
+
+			applyAutoTranslation (message, raw, embeds, src, out) {
+				let input = Object.assign({}, languages[src] || {id: src, name: src});
+				let output = Object.assign({}, languages[out] || {id: out, name: out});
+				let content = message.content || "";
+				if (typeof raw == "string") {
+					let oldContent = this.settings.general.showOriginalMessage && content.trim();
+					content = raw + (oldContent ? (!this.settings.general.useSpoilerInOriginal ? ("\n\n> *" + oldContent.split("\n").join("*\n> *") + "*").replace(/> \*\*\n/g, "> \n") : `\n\n||${oldContent}||`) : "");
+				}
+				embeds = embeds || {};
+				(message.embeds || []).forEach(embed => {if (embeds[embed.id]) embed.message_id = message.id;});
+				oldMessages[message.id] = new BDFDB.DiscordObjects.Message(message);
+				oldMessages[message.id].originalContentData = {content: message.content || ""};
+				translatedMessages[message.id] = {content, embeds, input, output};
+			}
+
+			getAutoOrigKey (message) {
+				let content = (message.content || "").trim();
+				if (content) return content;
+				return (message.embeds || []).map(embed => [embed.rawTitle, embed.rawDescription, embed.footer && embed.footer.text].concat((embed.fields || []).map(f => f.rawName + "\u0001" + f.rawValue)).join("\u0002")).join("\u0003");
+			}
+
+			getAutoCachePath () {
+				return require("path").join(BDFDB.BDUtils.getPluginsFolder(), "Translator.cache.json");
+			}
+
+			getAutoCache () {
+				if (autoCache) return autoCache;
+				autoCache = {};
+				try {
+					let fs = require("fs"), path = this.getAutoCachePath();
+					if (fs.existsSync(path)) {
+						let data = JSON.parse(fs.readFileSync(path, "utf8"));
+						if (data && typeof data == "object" && !Array.isArray(data)) autoCache = data;
+					}
+				}
+				catch (err) {BDFDB.LogUtils.error(["Could not read translation cache", err], this);}
+				return autoCache;
+			}
+
+			putAutoCache (message, entry) {
+				this.getAutoCache()[message.id] = Object.assign({o: this.getAutoOrigKey(message), t: Date.now()}, entry);
+				autoCacheDirty = true;
+				if (!autoCacheSaveTimeout) autoCacheSaveTimeout = BDFDB.TimeUtils.timeout(_ => {
+					autoCacheSaveTimeout = null;
+					this.saveAutoCache();
+				}, 5000);
+			}
+
+			saveAutoCache (sync = false) {
+				if (!autoCacheDirty || !autoCache) return;
+				autoCacheDirty = false;
+				let ids = Object.keys(autoCache);
+				if (ids.length > AUTO_CACHE_MAX) {
+					ids.sort((a, b) => (autoCache[a].t || 0) - (autoCache[b].t || 0));
+					for (let id of ids.slice(0, ids.length - AUTO_CACHE_MAX)) delete autoCache[id];
+				}
+				try {
+					let fs = require("fs"), path = this.getAutoCachePath(), data = JSON.stringify(autoCache);
+					if (sync) {
+						fs.writeFileSync(path + ".tmp", data);
+						fs.renameSync(path + ".tmp", path);
+					}
+					else fs.writeFile(path + ".tmp", data, err => {
+						if (err) return BDFDB.LogUtils.error(["Could not write translation cache", err], this);
+						fs.rename(path + ".tmp", path, _ => {});
+					});
+				}
+				catch (err) {BDFDB.LogUtils.error(["Could not write translation cache", err], this);}
+			}
+
+			clearAutoCache () {
+				autoCache = {};
+				autoCacheDirty = true;
+				this.saveAutoCache(true);
+				autoSeen = {};
+				translatedMessages = {};
+				BDFDB.MessageUtils.rerenderAll(true);
+			}
+
+			scheduleAutoRerender (delay = 150) {
+				if (autoRerenderTimeout) return;
+				if (!this._autoScrollHook) {
+					this._autoLastScroll = 0;
+					this._autoScrollHook = e => {
+						let t = e.target;
+						if (t && t.nodeType == 1 && t.matches && t.matches(BDFDB.dotCN.messagesscroller)) this._autoLastScroll = Date.now();
+					};
+					this._autoWheelHook = _ => {this._autoLastScroll = Date.now(); this._autoUserMoved = true;};
+					document.addEventListener("scroll", this._autoScrollHook, true);
+					document.addEventListener("wheel", this._autoWheelHook, {capture: true, passive: true});
+					document.addEventListener("keydown", this._autoWheelHook, true);
+				}
+				autoRerenderTimeout = BDFDB.TimeUtils.timeout(_ => {
+					autoRerenderTimeout = null;
+					if (Date.now() - this._autoLastScroll < 2500) return this.scheduleAutoRerender(700);
+					let scroller = document.querySelector(BDFDB.dotCN.messagesscroller);
+					let anchor = null;
+					if (scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 60) {
+						let top = scroller.getBoundingClientRect().top;
+						let li = Array.from(scroller.querySelectorAll('li[id^="chat-messages-"]')).find(n => n.getBoundingClientRect().bottom > top + 1);
+						if (li) anchor = {id: li.id, offset: li.getBoundingClientRect().top - top};
+					}
+					BDFDB.MessageUtils.rerenderAll(true);
+					if (!anchor) return;
+					this._autoUserMoved = false;
+					let end = Date.now() + 1500;
+					let pin = _ => {
+						if (this._autoUserMoved || Date.now() > end) return;
+						let s = document.querySelector(BDFDB.dotCN.messagesscroller);
+						let el = s && document.getElementById(anchor.id);
+						if (s && el) {
+							let delta = (el.getBoundingClientRect().top - s.getBoundingClientRect().top) - anchor.offset;
+							if (Math.abs(delta) > 1) s.scrollTop += delta;
+						}
+						requestAnimationFrame(pin);
+					};
+					requestAnimationFrame(pin);
+				}, delay);
+			}
+
+			translateMessage (message, channel, silent = false) {
 				return new Promise(callback => {
 					if (!message) return callback(null);
 					if (translatedMessages[message.id]) {
@@ -1218,6 +1672,7 @@ module.exports = (_ => {
 						message.embeds.forEach(embed => embed.message_id = message.id);
 						let embedIds = message.embeds.map(embed => embed.id);
 						this.translateText(allTextsToTranslate, messageTypes.RECEIVED, (translation, input, output) => {
+							if (translation && silent && input && output && input.id == output.id) translation = "";
 							if (translation) {
 								let oldStrings = originalContentData.content.split(/\n{0,1}__________________ __________________ __________________\n{0,1}/);
 								let strings = translation.split(/\n{0,1}__________________ __________________ __________________\n{0,1}/);
@@ -1246,18 +1701,20 @@ module.exports = (_ => {
 									input,
 									output
 								};
-								BDFDB.MessageUtils.rerenderAll(true);
+								if (silent) this.scheduleAutoRerender();
+								else BDFDB.MessageUtils.rerenderAll(true);
 							}
 							callback(true);
-						});
+						}, null, silent);
 					}
 				});
 			}
 
-			translateText (text, place, callback, forcedOutputLanguage = null) {
+			translateText (text, place, callback, forcedOutputLanguage = null, silent = false) {
 				let toast = null, toastInterval, finished = false, finishTranslation = translation => {
-					isTranslating = false;
+					if (!silent) isTranslating = false;
 					if (toast) toast.close();
+					BDFDB.TimeUtils.clear(toastInterval);
 					
 					if (finished) return;
 					finished = true;
@@ -1293,10 +1750,14 @@ module.exports = (_ => {
 					}
 					else {
 						const startTranslating = engine => {
-							isTranslating = true;
+							if (!silent) isTranslating = true;
 							if (toast) toast.close();
 							BDFDB.TimeUtils.clear(toastInterval);
 							
+							if (silent) {
+								toastInterval = BDFDB.TimeUtils.interval((_, count) => {if (count >= 40) finishTranslation("");}, 500);
+								return;
+							}
 							toast = BDFDB.NotificationUtils.toast(`${this.labels.toast_translating} (${translationEngines[engine].name}) - ${BDFDB.LanguageUtils.LibraryStrings.please_wait}`, {
 								timeout: 0,
 								ellipsis: true,
